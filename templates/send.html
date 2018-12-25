@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Send page</title>
+  </head>
+  <body>
+    <h1>Send file</h1>
+
+    <form action="/send" method="post" enctype="multipart/form-data">
+      <label for="input-filename" >Name</label>
+      <input name="file_name" id="input-filename" required>
+
+      <label for="input-file">File</label>
+      <input type="file" name="file_data" id="input-file" required>
+
+      <button type="submit" >Send</button>
+    </form>
+  </body>
+</html>

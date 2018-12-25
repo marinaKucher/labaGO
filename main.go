@@ -1,437 +1,184 @@
 package main
 
 import (
-	"archive/zip"
-	"bytes"
-	"crypto/sha1"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/binary"
-	"errors"
-	"flag"
-	"fmt"
-	"hash"
-	"io"
+	"database/sql"
+	"html/template"
 	"io/ioutil"
-	"os"
-	"path/filepath"
-	"time"
+	"log"
+	"net/http"
+	"strconv"
+	"sync"
 
-	"github.com/fullsailor/pkcs7"
-	yaml "gopkg.in/yaml.v2"
+	"github.com/gocraft/web"
+	_ "github.com/nakagami/firebirdsql"
 )
 
-func main() {
+var templates = template.Must(template.ParseGlob("templates/*.html"))
 
-	var mode, hash, pkey, cert, path, szp string
-	flag.StringVar(&mode, "mode", "z", "choosing program mode")
-	flag.StringVar(&hash, "hash", "", "fingerprint of certificate")
-	flag.StringVar(&cert, "cert", "my.crt", "path to certificate file")
-	flag.StringVar(&pkey, "pkey", "my.key", "path to private key file")
-	flag.StringVar(&path, "path", "mydir", "working directory")
-	flag.StringVar(&szp, "szp", "data.szp", "name of output szp file")
+var mutex sync.RWMutex
 
-	flag.Parse()
+var cache = make(map[int]*Document)
 
-	switch mode {
-	case "z":
-		files, err := getFileList("./" + path)
-		if err != nil {
-			fmt.Printf("Error has occured: %s\n", err.Error())
-			return
-		}
+var db *sql.DB
 
-		err = createSzp(files, szp, pkey, cert)
-		if err != nil {
-			fmt.Printf("Error has occured: %s\n", err.Error())
-			return
-		}
-	case "x":
-		if len(hash) != 40 {
-			fmt.Printf("Error has occured: %s\n", "Please, enter valid fingerprint")
-			return
-		}
-		err := extractSzp(szp, hash, path)
-		if err != nil {
-			fmt.Printf("Error has occured: %s\n", err.Error())
-			return
-		}
-	case "i":
-		err := getMeta(szp)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-	default:
-		fmt.Println("Use -mode only with \"z\", \"x\", \"i\" flags")
-	}
-
+//Context
+type Context struct {
 }
 
-//Receives name of directory to zip and returns list of files to zip
-func getFileList(dir string) ([]string, error) {
-	var fileNames []string
-	files, err := ioutil.ReadDir(dir)
+type Document struct {
+	Name string
+	Data []byte
+}
+
+func (c *Context) renderHomePage(rw web.ResponseWriter, req *web.Request) {
+	rw.Header().Set("Location", "/docs")
+	rw.WriteHeader(http.StatusTemporaryRedirect)
+}
+
+func (c *Context) getDocList(rw web.ResponseWriter, req *web.Request) {
+	log.Println(0)
+	rows, err := db.Query("SELECT id, name FROM docs;")
 	if err != nil {
-		return nil, err
+		log.Println(1)
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+	}
+	defer rows.Close()
+
+	names := make(map[int]string)
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			log.Println(5)
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+		}
+		names[id] = name
 	}
 
-	for _, file := range files {
-		if file.IsDir() {
-			subdirfiles, err := getFileList(dir + "/" + file.Name())
-			if err != nil {
-				return nil, err
+	err = templates.ExecuteTemplate(rw, "list.html", names)
+	if err != nil {
+		log.Println(2)
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func renderDoc(rw web.ResponseWriter, title, data string) {
+	err := templates.ExecuteTemplate(rw, "doc.html", struct {
+		Title string
+		Data  string
+	}{
+		title,
+		data})
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (c *Context) getDoc(rw web.ResponseWriter, req *web.Request) {
+	id, err := strconv.Atoi(req.PathParams["id"])
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+	}
+
+	mutex.RLock()
+	value, isCached := cache[id]
+	mutex.RUnlock()
+
+	if isCached {
+		renderDoc(rw, value.Name, string(value.Data))
+	} else {
+		result := db.QueryRow("SELECT name, data FROM docs WHERE id=$1;", id)
+
+		var name string
+		var data []byte
+		err = result.Scan(&name, &data)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				renderDoc(rw, "Такого документа не существует", "Извините :(")
 			}
-
-			fileNames = append(fileNames, subdirfiles...)
-		} else {
-			fileNames = append(fileNames, dir+"/"+file.Name())
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
 		}
-	}
+		mutex.Lock()
+		cache[id] = &Document{Name: name,
+			Data: data}
+		mutex.Unlock()
 
-	return fileNames, nil
+		renderDoc(rw, name, string(data))
+	}
 }
 
-//returns bytes of new zip archive
-func zipFiles(files []string) (archive []byte, err error) {
-	buf := new(bytes.Buffer)
-
-	w := zip.NewWriter(buf)
-
-	for _, file := range files {
-		fileBytes, err := ioutil.ReadFile(file)
-		if err != nil {
-
-			return nil, err
-		}
-
-		f, err := w.Create(file[1:])
-		if err != nil {
-			return nil, err
-		}
-		_, err = f.Write(fileBytes)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	err = w.Close()
+func (c *Context) deleteDoc(rw web.ResponseWriter, req *web.Request) {
+	id, err := strconv.Atoi(req.PathParams["id"])
 	if err != nil {
-		return nil, err
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 	}
 
-	return buf.Bytes(), nil
+	mutex.RLock()
+	_, isCached := cache[id]
+	mutex.RUnlock()
+
+	if isCached {
+		mutex.Lock()
+		delete(cache, id)
+		mutex.Unlock()
+	}
+
+	_, err = db.Exec("DELETE FROM docs WHERE id=$1;", id)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+	}
+
+	rw.Header().Set("Location", "/docs")
+	rw.WriteHeader(http.StatusMovedPermanently)
 }
 
-//creates signed zip package
-func createSzp(files []string, newFile, keyPath, certPath string) error {
-	metas, err := createMeta(files)
+func (c *Context) sendDocForm(rw web.ResponseWriter, req *web.Request) {
+	err := templates.ExecuteTemplate(rw, "send.html", c)
 	if err != nil {
-		return err
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 	}
+}
 
-	archive, err := zipFiles(files)
+func (c *Context) sendDoc(rw web.ResponseWriter, req *web.Request) {
+	file, _, err := req.FormFile("file_data")
 	if err != nil {
-		return err
-	}
-
-	metaLength := make([]byte, 4)
-	binary.LittleEndian.PutUint32(metaLength, uint32(len(metas)))
-
-	data := append(metaLength, metas...)
-	data = append(data, archive...)
-
-	szp, err := signFile(data, keyPath, certPath)
-	if err != nil {
-		return err
-	}
-
-	file, err := os.Create(newFile)
-	if err != nil {
-		return err
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 	}
 	defer file.Close()
 
-	_, err = file.Write(szp)
+	data, err := ioutil.ReadAll(file)
 	if err != nil {
-		return err
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 	}
 
-	return nil
+	_, err = db.Exec("INSERT INTO docs(name, data) VALUES($1, $2);", req.FormValue("file_name"), data)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+	}
+
+	rw.Header().Set("Location", "/docs")
+	rw.WriteHeader(http.StatusMovedPermanently)
 }
 
-//creates zipped metadata file
-func createMeta(files []string) (metaBytes []byte, err error) {
-	metas := make(map[string]meta)
-
-	var metaInfo meta
-	var h hash.Hash
-
-	for i := range files {
-		openedFile, err := os.Open(files[i])
-		if err != nil {
-			return nil, err
-		}
-		info, err := openedFile.Stat()
-		if err != nil {
-
-			return nil, err
-		}
-
-		metaInfo.Name = info.Name()
-		metaInfo.Size = info.Size()
-		metaInfo.ModTime = info.ModTime()
-
-		h = sha1.New()
-		if _, err := io.Copy(h, openedFile); err != nil {
-			return nil, err
-		}
-
-		metaInfo.Hash = fmt.Sprintf("%x", h.Sum(nil))
-
-		metas[files[i][1:]] = metaInfo
-
-		err = openedFile.Close()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	bytesToZip, err := yaml.Marshal(metas)
+func main() {
+	connStr := "SYSDBA:masterkey@LOCALHOST:27015/C:\\Users\\User\\Desktop\\BD\\GOLAB.fdb"
+	d, err := sql.Open("firebirdsql", connStr)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
+	defer db.Close()
 
-	buf := new(bytes.Buffer)
-	w := zip.NewWriter(buf)
+	db = d
 
-	f, err := w.Create("metas")
-	if err != nil {
-		return nil, err
-	}
-	_, err = f.Write(bytesToZip)
-	if err != nil {
-		return nil, err
-	}
+	rootRouter := web.New(Context{}).
+		Middleware(web.LoggerMiddleware).
+		Middleware(web.ShowErrorsMiddleware).
+		Get("/", (*Context).renderHomePage).
+		Get("/docs", (*Context).getDocList).
+		Get("/docs/:id", (*Context).getDoc).
+		Get("/send", (*Context).sendDocForm).
+		Post("/send", (*Context).sendDoc).
+		Get("/delete/:id", (*Context).deleteDoc)
 
-	err = w.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
-}
-
-//signes file which consists of metadata and archive
-func signFile(fileBytes []byte, keyPath, certPath string) ([]byte, error) {
-	signedData, err := pkcs7.NewSignedData(fileBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		return nil, err
-	}
-
-	parsedCert, err := x509.ParseCertificate(cert.Certificate[0])
-	if err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("SHA1 fingerprint is %x\n", sha1.Sum(parsedCert.Raw))
-
-	if err := signedData.AddSigner(parsedCert, cert.PrivateKey, pkcs7.SignerInfoConfig{}); err != nil {
-		return nil, err
-	}
-
-	signedFileBytes, err := signedData.Finish()
-	if err != nil {
-		return nil, err
-	}
-
-	return signedFileBytes, nil
-}
-
-//extracts signed zip package
-func extractSzp(filePath, fingerprint, dest string) error {
-	fileBytes, err := verifySzp(filePath, fingerprint)
-	if err != nil {
-		return err
-	}
-
-	sizeBytes := fileBytes[0:4]
-	metaSize := binary.LittleEndian.Uint32(sizeBytes)
-
-	var metasArchive []byte
-	metasArchive = fileBytes[4 : 4+metaSize]
-
-	metas, err := unzipMeta(metasArchive, metaSize)
-	if err != nil {
-		return err
-	}
-
-	err = unzipArchive(fileBytes[4+metaSize:], metas, dest)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-//verifies certificate of signed zip package
-func verifySzp(filePath, ShaCert string) (content []byte, err error) {
-	fileBytes, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return nil, err
-	}
-
-	p7, err := pkcs7.Parse(fileBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	err = p7.Verify()
-	if err != nil {
-		return nil, err
-	}
-
-	if ShaCert != fmt.Sprintf("%x", sha1.Sum(p7.Certificates[0].Raw)) {
-		//fmt.Println(ShaCert)
-		//fmt.Printf("%x\n", sha1.Sum(p7.Certificates[0].Raw))
-		return nil, errors.New("error has occured: invalid sha1")
-	}
-	fmt.Println("Certificate is correct")
-
-	return p7.Content, nil
-}
-
-//unzips metadate from zip archive
-func unzipMeta(archiveBytes []byte, size uint32) (map[string]meta, error) {
-	metas := make(map[string]meta)
-
-	r, err := zip.NewReader(bytes.NewReader(archiveBytes), int64(size))
-	if err != nil {
-		return nil, err
-	}
-
-	rc, err := r.File[0].Open()
-	if err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, r.File[0].UncompressedSize)
-
-	rc.Read(buf)
-
-	err = yaml.Unmarshal(buf, &metas)
-	if err != nil {
-		return nil, err
-	}
-	return metas, nil
-}
-
-//unzips zip archive with data
-func unzipArchive(archiveBytes []byte, metas map[string]meta, dest string) error {
-	r, err := zip.NewReader(bytes.NewReader(archiveBytes), int64(len(archiveBytes)))
-	if err != nil {
-		return err
-	}
-	isValid, err := checkSha(r.File, metas)
-	if err != nil {
-		return err
-	}
-	if !isValid {
-		return errors.New("Files are invalid")
-	}
-
-	for _, zf := range r.File {
-		fpath := filepath.Join(dest, zf.Name)
-
-		err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm)
-		if err != nil {
-			return err
-		}
-
-		dst, err := os.Create(fpath)
-		if err != nil {
-			return err
-		}
-		defer dst.Close()
-		src, err := zf.Open()
-		if err != nil {
-			return err
-		}
-		defer src.Close()
-		_, err = io.Copy(dst, src)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-//validates files of archive
-func checkSha(files []*zip.File, metas map[string]meta) (bool, error) {
-	for _, zf := range files {
-		rc, err := zf.Open()
-		if err != nil {
-			return false, err
-		}
-
-		buf := make([]byte, zf.UncompressedSize)
-
-		rc.Read(buf)
-
-		if metas[zf.Name].Hash != fmt.Sprintf("%x", sha1.Sum(buf)) {
-			return false, nil
-		}
-	}
-	fmt.Println("Files are valid")
-	return true, nil
-}
-
-//gets information about files from metadata file
-func getMeta(szpPath string) error {
-	fileBytes, err := ioutil.ReadFile(szpPath)
-	if err != nil {
-		return err
-	}
-
-	p7, err := pkcs7.Parse(fileBytes)
-	if err != nil {
-		return err
-	}
-
-	err = p7.Verify()
-	if err != nil {
-		return err
-	}
-
-	sizeBytes := p7.Content[0:4]
-	metaSize := binary.LittleEndian.Uint32(sizeBytes)
-
-	metas, err := unzipMeta(p7.Content[4:4+metaSize], metaSize)
-	if err != nil {
-		return err
-	}
-
-	for key, value := range metas {
-		fmt.Printf("Path: %s\n", key)
-		fmt.Printf("Size: %d\n", value.Size)
-		fmt.Printf("Modification time: %d-%02d-%02dT%02d:%02d:%02d-00:00\n",
-			value.ModTime.Year(), value.ModTime.Month(), value.ModTime.Day(),
-			value.ModTime.Hour(), value.ModTime.Minute(), value.ModTime.Second())
-		fmt.Printf("Hash: %s\n", value.Hash)
-	}
-	return nil
-}
-
-//struct to marshall information about files
-type meta struct {
-	Name    string
-	Size    int64
-	ModTime time.Time
-	Hash    string
+	panic(http.ListenAndServe("localhost:3000", rootRouter))
 }

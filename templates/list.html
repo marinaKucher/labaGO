@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Documents list</title>
+  </head>
+  <body>   
+    <h2>Files</h2>
+    <hr>
+    <ul>
+      {{range $key, $value := .}}
+        <li>              
+            <p>
+                <a href="/docs/{{$key}}">{{$value}}</a>
+            </p> 
+        </li>
+      {{else}}
+        <p>No files</p>
+      {{end}}
+    </ul> 
+  </body>
+</html>
